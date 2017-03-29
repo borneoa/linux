@@ -201,6 +201,18 @@ struct drm_fb_helper {
 	struct work_struct resume_work;
 
 	/**
+	 * @lock:
+	 *
+	 * Top-level FB helper lock. This protects all internal data structures
+	 * and lists, such as @connector_info and @crtc_info.
+	 *
+	 * FIXME: fbdev emulation locking is a mess and long term we want to
+	 * protect all helper internal state with this lock as well as reduce
+	 * core KMS locking as much as possible.
+	 */
+	struct mutex lock;
+
+	/**
 	 * @kernel_fb_list:
 	 *
 	 * Entry on the global kernel_fb_helper_list, used for kgdb entry/exit.
