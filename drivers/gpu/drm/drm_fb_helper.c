@@ -505,6 +505,36 @@ static int restore_fbdev_mode(struct drm_fb_helper *fb_helper)
 		return restore_fbdev_mode_legacy(fb_helper);
 }
 
+static int __drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper);
+
+static int
+__drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper)
+{
+	struct drm_device *dev = fb_helper->dev;
+	bool do_delayed;
+	int ret;
+
+	if (!drm_fbdev_emulation)
+		return -ENODEV;
+
+	WARN_ON(!mutex_is_locked(&fb_helper->lock));
+
+	drm_modeset_lock_all(dev);
+
+	ret = restore_fbdev_mode(fb_helper);
+
+	do_delayed = fb_helper->delayed_hotplug;
+	if (do_delayed)
+		fb_helper->delayed_hotplug = false;
+
+	drm_modeset_unlock_all(dev);
+
+	if (do_delayed)
+		__drm_fb_helper_hotplug_event(fb_helper);
+
+	return ret;
+}
+
 /**
  * drm_fb_helper_restore_fbdev_mode_unlocked - restore fbdev configuration
  * @fb_helper: fbcon to restore
@@ -518,27 +548,11 @@ static int restore_fbdev_mode(struct drm_fb_helper *fb_helper)
  */
 int drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper)
 {
-	struct drm_device *dev = fb_helper->dev;
-	bool do_delayed;
 	int ret;
 
-	if (!drm_fbdev_emulation)
-		return -ENODEV;
-
 	mutex_lock(&fb_helper->lock);
-	drm_modeset_lock_all(dev);
-
-	ret = restore_fbdev_mode(fb_helper);
-
-	do_delayed = fb_helper->delayed_hotplug;
-	if (do_delayed)
-		fb_helper->delayed_hotplug = false;
-
-	drm_modeset_unlock_all(dev);
+	ret = __drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
 	mutex_unlock(&fb_helper->lock);
-
-	if (do_delayed)
-		drm_fb_helper_hotplug_event(fb_helper);
 
 	return ret;
 }
@@ -1500,7 +1514,7 @@ int drm_fb_helper_set_par(struct fb_info *info)
 		return -EINVAL;
 	}
 
-	drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
+	__drm_fb_helper_restore_fbdev_mode_unlocked(fb_helper);
 
 	return 0;
 }
@@ -2356,6 +2370,46 @@ out:
 	kfree(enabled);
 }
 
+static int __drm_fb_helper_initial_config(struct drm_fb_helper *fb_helper,
+					  int bpp_sel)
+{
+	struct drm_device *dev = fb_helper->dev;
+	struct fb_info *info;
+	int ret;
+
+	if (!drm_fbdev_emulation)
+		return 0;
+
+	WARN_ON(!mutex_is_locked(&fb_helper->lock));
+
+	mutex_lock(&dev->mode_config.mutex);
+	drm_setup_crtcs(fb_helper,
+			dev->mode_config.max_width,
+			dev->mode_config.max_height);
+	ret = drm_fb_helper_single_fb_probe(fb_helper, bpp_sel);
+	mutex_unlock(&dev->mode_config.mutex);
+	if (ret)
+		return ret;
+
+	info = fb_helper->fbdev;
+	info->var.pixclock = 0;
+	ret = register_framebuffer(info);
+	if (ret < 0)
+		return ret;
+
+	dev_info(dev->dev, "fb%d: %s frame buffer device\n",
+		 info->node, info->fix.id);
+
+	mutex_lock(&kernel_fb_helper_lock);
+	if (list_empty(&kernel_fb_helper_list))
+		register_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
+
+	list_add(&fb_helper->kernel_fb_list, &kernel_fb_helper_list);
+	mutex_unlock(&kernel_fb_helper_lock);
+
+	return 0;
+}
+
 /**
  * drm_fb_helper_initial_config - setup a sane initial connector configuration
  * @fb_helper: fb_helper device struct
@@ -2400,41 +2454,50 @@ out:
  */
 int drm_fb_helper_initial_config(struct drm_fb_helper *fb_helper, int bpp_sel)
 {
-	struct drm_device *dev = fb_helper->dev;
-	struct fb_info *info;
 	int ret;
+
+	mutex_lock(&fb_helper->lock);
+	ret = __drm_fb_helper_initial_config(fb_helper, bpp_sel);
+	mutex_unlock(&fb_helper->lock);
+
+	return ret;
+}
+EXPORT_SYMBOL(drm_fb_helper_initial_config);
+
+static int __drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
+{
+	struct drm_device *dev = fb_helper->dev;
+	unsigned int width, height;
 
 	if (!drm_fbdev_emulation)
 		return 0;
 
+	WARN_ON(!mutex_is_locked(&fb_helper->lock));
+
 	mutex_lock(&dev->mode_config.mutex);
-	drm_setup_crtcs(fb_helper,
-			dev->mode_config.max_width,
-			dev->mode_config.max_height);
-	ret = drm_fb_helper_single_fb_probe(fb_helper, bpp_sel);
+
+	if (!fb_helper->fb || !drm_fb_helper_is_bound(fb_helper)) {
+		fb_helper->delayed_hotplug = true;
+		mutex_unlock(&dev->mode_config.mutex);
+		return 0;
+	}
+
+	DRM_DEBUG_KMS("\n");
+
+	width = dev->mode_config.max_width;
+	height = dev->mode_config.max_height;
+
+	if (drm_fb_helper_probe_connector_modes(fb_helper, width, height) == 0)
+		DRM_DEBUG_KMS("No connectors reported connected with modes\n");
+
+	drm_setup_crtcs(fb_helper, fb_helper->fb->width, fb_helper->fb->height);
+
 	mutex_unlock(&dev->mode_config.mutex);
-	if (ret)
-		return ret;
 
-	info = fb_helper->fbdev;
-	info->var.pixclock = 0;
-	ret = register_framebuffer(info);
-	if (ret < 0)
-		return ret;
-
-	dev_info(dev->dev, "fb%d: %s frame buffer device\n",
-		 info->node, info->fix.id);
-
-	mutex_lock(&kernel_fb_helper_lock);
-	if (list_empty(&kernel_fb_helper_list))
-		register_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
-
-	list_add(&fb_helper->kernel_fb_list, &kernel_fb_helper_list);
-	mutex_unlock(&kernel_fb_helper_lock);
+	drm_fb_helper_set_par(fb_helper->fbdev);
 
 	return 0;
 }
-EXPORT_SYMBOL(drm_fb_helper_initial_config);
 
 /**
  * drm_fb_helper_hotplug_event - respond to a hotplug notification by
@@ -2459,35 +2522,13 @@ EXPORT_SYMBOL(drm_fb_helper_initial_config);
  */
 int drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
 {
-	struct drm_device *dev = fb_helper->dev;
-	int err = 0;
-
-	if (!drm_fbdev_emulation)
-		return 0;
+	int ret;
 
 	mutex_lock(&fb_helper->lock);
-	mutex_lock(&dev->mode_config.mutex);
-
-	if (!fb_helper->fb || !drm_fb_helper_is_bound(fb_helper)) {
-		fb_helper->delayed_hotplug = true;
-		mutex_unlock(&dev->mode_config.mutex);
-		goto unlock;
-	}
-
-	DRM_DEBUG_KMS("\n");
-
-	drm_setup_crtcs(fb_helper, fb_helper->fb->width, fb_helper->fb->height);
-
-	mutex_unlock(&dev->mode_config.mutex);
+	ret = __drm_fb_helper_hotplug_event(fb_helper);
 	mutex_unlock(&fb_helper->lock);
 
-	drm_fb_helper_set_par(fb_helper->fbdev);
-
-	return 0;
-
-unlock:
-	mutex_unlock(&fb_helper->lock);
-	return err;
+	return ret;
 }
 EXPORT_SYMBOL(drm_fb_helper_hotplug_event);
 
