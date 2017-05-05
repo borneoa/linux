@@ -465,6 +465,7 @@ static struct k3_dma_desc_sw *k3_dma_alloc_desc_resource(int num,
 		return NULL;
 	}
 	ds->desc_num = num;
+	dev_info(chan->device->dev, "Alloc %p\n", ds);
 	return ds;
 }
 
@@ -691,6 +692,7 @@ static void k3_dma_free_desc(struct virt_dma_desc *vd)
 		container_of(vd, struct k3_dma_desc_sw, vd);
 	struct k3_dma_dev *d = to_k3_dma(vd->tx.chan->device);
 
+	dev_info(d->slave.dev, "Free %p\n", ds);
 	dma_pool_free(d->pool, ds->desc_hw, ds->desc_hw_lli);
 	kfree(ds);
 }
