@@ -530,6 +530,6 @@
 		reg = <0>;
 		pl022,com-mode = <2>;
 		pl022,rx-level-trig = <1>;
-		status = "disabled";
+		status = "ok";
 	};
 };
